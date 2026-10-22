@@ -26,12 +26,10 @@ GxEPD2_3C<GxEPD2_750c_Z90, GxEPD2_750c_Z90::HEIGHT / 16> display(
     GxEPD2_750c_Z90(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
 );
 
-#define PNG_BUF_SIZE 24000
+#define PNG_BUF_SIZE 16000
 static uint8_t *pngBuf = nullptr;   // allocated per fetch
-// Black and red planes (1 bit/pixel, 1 = white / no red). Allocated on the heap per fetch
-// so they do not eat static DRAM.
-static uint8_t *frameBuf = nullptr;   // black plane
-static uint8_t *redBuf   = nullptr;   // red plane
+// Rows of the current display page; the PNG callback only draws rows inside this window.
+static int gPageY0 = 0, gPageY1 = 0;
 
 PNG         png;
 Preferences prefs;
@@ -279,17 +277,15 @@ void handleConfig() {
 // ── PNG decode callback ───────────────────────────────
 
 int pngDrawCallback(PNGDRAW *pDraw) {
+    int y = pDraw->y;
+    if (y < gPageY0 || y >= gPageY1) return 1;     // not in the page being drawn
     uint16_t lineRGB[PANEL_W];
     png.getLineAsRGB565(pDraw, lineRGB, PNG_RGB565_LITTLE_ENDIAN, 0xFFFFFFFF);
-    int rowBase = pDraw->y * ROW_BYTES;
     for (int x = 0; x < PANEL_W; x++) {
         uint16_t p = lineRGB[x];
         uint8_t r = p >> 11, g = (p >> 5) & 0x3F, b = p & 0x1F;
-        if (r >= 20 && g < 24 && b < 12) {            // red
-            redBuf[rowBase + x / 8]   &= ~(0x80 >> (x % 8));
-        } else if (p < 0x8000) {                       // dark -> black
-            frameBuf[rowBase + x / 8] &= ~(0x80 >> (x % 8));
-        }
+        if (r >= 20 && g < 24 && b < 12)  display.drawPixel(x, y, GxEPD_RED);
+        else if (p < 0x8000)              display.drawPixel(x, y, GxEPD_BLACK);
     }
     return 1;
 }
@@ -304,6 +300,7 @@ static void fetchAndDisplayImpl() {
     secureClient.setInsecure();
 
     HTTPClient http;
+    http.setReuse(false);           // do not keep the connection (and its TLS memory) alive
     if (!http.begin(secureClient, url)) {
         Serial.println("HTTP begin failed");
         return;
@@ -337,7 +334,10 @@ static void fetchAndDisplayImpl() {
         }
     }
     http.end();
-    Serial.printf("Downloaded %d bytes\n", pngLen);
+    // Release the TLS session now so its buffers (~40 KB) are free again.
+    secureClient.stop();
+    Serial.printf("Downloaded %d bytes  (free heap %u, largest block %u)\n",
+                  pngLen, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     if (pngLen == 0) return;
 
     int rc = png.openRAM(pngBuf, pngLen, pngDrawCallback);
@@ -347,30 +347,30 @@ static void fetchAndDisplayImpl() {
         png.close(); return;
     }
 
-    frameBuf = (uint8_t*)malloc(ROW_BYTES * PANEL_H);
-    redBuf   = (uint8_t*)malloc(ROW_BYTES * PANEL_H);
-    if (!frameBuf || !redBuf) {
-        Serial.println("Out of memory for frame buffers");
-        free(frameBuf); free(redBuf); frameBuf = redBuf = nullptr;
-        png.close(); return;
-    }
-    memset(frameBuf, 0xFF, ROW_BYTES * PANEL_H);
-    memset(redBuf,   0xFF, ROW_BYTES * PANEL_H);
-    rc = png.decode(NULL, 0);
     png.close();
-    if (rc != PNG_SUCCESS) {
-        Serial.printf("PNG decode error: %d\n", rc);
-        free(frameBuf); free(redBuf); frameBuf = redBuf = nullptr;
-        return;
-    }
 
-    // 3-colour panel: black plane + red plane (0 bit = ink in both)
-    display.epd2.writeImage(frameBuf, redBuf, 0, 0, PANEL_W, PANEL_H, false, false, false);
-    display.epd2.refresh(false);   // full refresh (this panel has no partial refresh)
-    display.epd2.powerOff();
-    free(frameBuf); free(redBuf); frameBuf = redBuf = nullptr;
+    // Paged drawing: the PNG stays in RAM (~5 KB) and is decoded once per display page
+    // (33 rows each), so no 58 KB frame buffers are needed.
+    const int pageH = display.pageHeight();
+    int page = 0;
+    bool decodeOk = true;
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        gPageY0 = page * pageH;
+        gPageY1 = gPageY0 + pageH;
+        display.fillScreen(GxEPD_WHITE);
+        rc = png.openRAM(pngBuf, pngLen, pngDrawCallback);
+        if (rc == PNG_SUCCESS) { rc = png.decode(NULL, 0); png.close(); }
+        if (rc != PNG_SUCCESS && decodeOk) {
+            Serial.printf("PNG decode error: %d (page %d)\n", rc, page);
+            decodeOk = false;
+        }
+        page++;
+    } while (display.nextPage());     // last page triggers the full refresh + power off
+
     refreshCount++;
-    Serial.printf("Display updated (full refresh)\n");
+    Serial.printf("Display updated (full refresh, %d pages)\n", page);
 }
 
 void fetchAndDisplay() {
