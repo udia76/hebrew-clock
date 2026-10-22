@@ -239,7 +239,7 @@ void handleRoot() {
 
 void handleConfig() {
     if (server.hasArg("url") && server.arg("url").length() > 0)
-        imageUrl = server.arg("url");
+        { imageUrl = server.arg("url"); imageUrl.trim(); }
     if (server.hasArg("font"))
         selectedFont = server.arg("font");
     if (server.hasArg("location"))
@@ -434,7 +434,9 @@ void setup() {
 
     wm.setSaveParamsCallback([&]() {
         prefs.begin("epaper", false);
-        prefs.putString("url",    String(paramUrl.getValue()));
+        String u = String(paramUrl.getValue());
+        u.trim();                       // pasted URLs often carry stray spaces
+        prefs.putString("url",    u);
         prefs.putUInt("interval", (uint32_t)atoi(paramMin.getValue()));
         prefs.end();
     });
@@ -460,6 +462,7 @@ void setup() {
 
     prefs.begin("epaper", true);
     imageUrl         = prefs.getString("url",         "");
+    imageUrl.trim();
     refreshInterval  = prefs.getUInt("interval",      60);
     selectedFont     = prefs.getString("font",        "Heebo-Bold");
     location         = prefs.getString("location",    "Tel Aviv");
