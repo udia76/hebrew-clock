@@ -76,10 +76,9 @@ async def get_clock(
     loc = location or "Tel Aviv"
     w = await weather_svc.get_weather(loc, request.app.state.http_client)
 
-    jdate = None
-    if calendar == "jewish":
-        today = clock.get_israel_time().date()
-        jdate = await jewish_cal_svc.get_jewish_date(today, request.app.state.http_client)
+    # The Hebrew date is always shown (header or footer), so always fetch it (cached 24 h).
+    today = clock.get_israel_time().date()
+    jdate = await jewish_cal_svc.get_jewish_date(today, request.app.state.http_client)
 
     img_bytes = await run_in_threadpool(
         clock.generate_clock_image,
@@ -87,6 +86,7 @@ async def get_clock(
         sleep_time  = sleeptime == "1",
         weather     = w,
         jewish_date = jdate,
+        calendar    = calendar,
     )
     return Response(
         content=img_bytes,

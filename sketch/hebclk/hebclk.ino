@@ -1,4 +1,4 @@
-#include <GxEPD2_BW.h>
+#include <GxEPD2_3C.h>
 #include <WiFiManager.h>
 #include <Preferences.h>
 #include <PNGdec.h>
@@ -10,18 +10,28 @@
 #include <Fonts/FreeSans12pt7b.h>
 #include <RTClib.h>
 
-// XIAO ESP32C3 → Waveshare 7.5" V2 wiring
-#define EPD_CS   D2
-#define EPD_DC   D3
-#define EPD_RST  D0
-#define EPD_BUSY D1
+// ESP32 (classic) -> HINK-E075A07-A0 7.5" 880x528 B/W/R panel (SSD1677, GxEPD2_750c_Z90)
+// Default hardware SPI pins: CLK=GPIO18, DIN/MOSI=GPIO23. Change the four below to match your wiring.
+#define EPD_CS   5
+#define EPD_DC   17
+#define EPD_RST  16
+#define EPD_BUSY 4
 
-GxEPD2_BW<GxEPD2_750_T7, 16> display(
-    GxEPD2_750_T7(EPD_CS, EPD_DC, EPD_RST, -1)
+#define PANEL_W 880
+#define PANEL_H 528
+#define ROW_BYTES (PANEL_W / 8)   // 110
+
+// Page buffer kept small (HEIGHT/16) so static DRAM fits on a classic ESP32.
+GxEPD2_3C<GxEPD2_750c_Z90, GxEPD2_750c_Z90::HEIGHT / 16> display(
+    GxEPD2_750c_Z90(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
 );
 
-static uint8_t pngBuf[30000];
-static uint8_t frameBuf[48000];
+#define PNG_BUF_SIZE 24000
+static uint8_t *pngBuf = nullptr;   // allocated per fetch
+// Black and red planes (1 bit/pixel, 1 = white / no red). Allocated on the heap per fetch
+// so they do not eat static DRAM.
+static uint8_t *frameBuf = nullptr;   // black plane
+static uint8_t *redBuf   = nullptr;   // red plane
 
 PNG         png;
 Preferences prefs;
@@ -31,7 +41,7 @@ String   imageUrl;
 uint32_t refreshInterval  = 60;
 uint32_t lastRefresh      = 0;
 uint8_t  refreshCount     = 0;
-String   selectedFont     = "NotoSansHebrew-Bold";
+String   selectedFont     = "Heebo-Bold";
 String   location         = "Tel Aviv";
 
 // Sleep schedule (ESP-side only — not sent to server as URL params)
@@ -184,7 +194,7 @@ static const char CONFIG_HTML[] PROGMEM = R"(<!DOCTYPE html>
       <input type="checkbox" name="rtc_en" id="rtc_en" value="1" {{RTC_EN_CHECKED}}>
       <span>Enable DS3231 RTC module</span>
     </div>
-    <p class="note">Wire SDA&rarr;D4, SCL&rarr;D5. On NTP success the RTC is updated; if NTP is unavailable the system clock is restored from the RTC so the sleep schedule keeps working.</p>
+    <p class="note">Wire SDA&rarr;GPIO21, SCL&rarr;GPIO22. On NTP success the RTC is updated; if NTP is unavailable the system clock is restored from the RTC so the sleep schedule keeps working.</p>
 
     <button type="submit">Save &amp; restart</button>
   </form>
@@ -269,19 +279,24 @@ void handleConfig() {
 // ── PNG decode callback ───────────────────────────────
 
 int pngDrawCallback(PNGDRAW *pDraw) {
-    uint16_t lineRGB[800];
+    uint16_t lineRGB[PANEL_W];
     png.getLineAsRGB565(pDraw, lineRGB, PNG_RGB565_LITTLE_ENDIAN, 0xFFFFFFFF);
-    int rowBase = pDraw->y * 100;
-    for (int x = 0; x < 800; x++) {
-        if (lineRGB[x] < 0x8000)
+    int rowBase = pDraw->y * ROW_BYTES;
+    for (int x = 0; x < PANEL_W; x++) {
+        uint16_t p = lineRGB[x];
+        uint8_t r = p >> 11, g = (p >> 5) & 0x3F, b = p & 0x1F;
+        if (r >= 20 && g < 24 && b < 12) {            // red
+            redBuf[rowBase + x / 8]   &= ~(0x80 >> (x % 8));
+        } else if (p < 0x8000) {                       // dark -> black
             frameBuf[rowBase + x / 8] &= ~(0x80 >> (x % 8));
+        }
     }
     return 1;
 }
 
 // ── Image fetch + display ─────────────────────────────
 
-void fetchAndDisplay() {
+static void fetchAndDisplayImpl() {
     String url = buildFetchUrl();
     Serial.printf("Fetching: %s\n", url.c_str());
 
@@ -305,14 +320,14 @@ void fetchAndDisplay() {
     WiFiClient *stream = http.getStreamPtr();
     int pngLen = 0;
 
-    if (contentLen > 0 && contentLen <= (int)sizeof(pngBuf)) {
+    if (contentLen > 0 && contentLen <= (int)PNG_BUF_SIZE) {
         pngLen = stream->readBytes(pngBuf, contentLen);
     } else {
         uint32_t deadline = millis() + 10000;
-        while ((http.connected() || stream->available()) && pngLen < (int)sizeof(pngBuf)) {
+        while ((http.connected() || stream->available()) && pngLen < (int)PNG_BUF_SIZE) {
             int avail = stream->available();
             if (avail > 0) {
-                int toRead = min(avail, (int)sizeof(pngBuf) - pngLen);
+                int toRead = min(avail, (int)PNG_BUF_SIZE - pngLen);
                 pngLen   += stream->readBytes(pngBuf + pngLen, toRead);
                 deadline  = millis() + 3000;
             } else if (millis() > deadline) {
@@ -327,21 +342,43 @@ void fetchAndDisplay() {
 
     int rc = png.openRAM(pngBuf, pngLen, pngDrawCallback);
     if (rc != PNG_SUCCESS) { Serial.printf("PNG open error: %d\n", rc); return; }
-    if (png.getWidth() != 800 || png.getHeight() != 480) {
+    if (png.getWidth() != PANEL_W || png.getHeight() != PANEL_H) {
         Serial.printf("Wrong dimensions: %dx%d\n", png.getWidth(), png.getHeight());
         png.close(); return;
     }
 
-    memset(frameBuf, 0xFF, sizeof(frameBuf));
+    frameBuf = (uint8_t*)malloc(ROW_BYTES * PANEL_H);
+    redBuf   = (uint8_t*)malloc(ROW_BYTES * PANEL_H);
+    if (!frameBuf || !redBuf) {
+        Serial.println("Out of memory for frame buffers");
+        free(frameBuf); free(redBuf); frameBuf = redBuf = nullptr;
+        png.close(); return;
+    }
+    memset(frameBuf, 0xFF, ROW_BYTES * PANEL_H);
+    memset(redBuf,   0xFF, ROW_BYTES * PANEL_H);
     rc = png.decode(NULL, 0);
     png.close();
-    if (rc != PNG_SUCCESS) { Serial.printf("PNG decode error: %d\n", rc); return; }
+    if (rc != PNG_SUCCESS) {
+        Serial.printf("PNG decode error: %d\n", rc);
+        free(frameBuf); free(redBuf); frameBuf = redBuf = nullptr;
+        return;
+    }
 
-    display.epd2.writeImage(frameBuf, 0, 0, 800, 480, false, false, false);
-    display.epd2.refresh(true);   // always partial
+    // 3-colour panel: black plane + red plane (0 bit = ink in both)
+    display.epd2.writeImage(frameBuf, redBuf, 0, 0, PANEL_W, PANEL_H, false, false, false);
+    display.epd2.refresh(false);   // full refresh (this panel has no partial refresh)
     display.epd2.powerOff();
+    free(frameBuf); free(redBuf); frameBuf = redBuf = nullptr;
     refreshCount++;
-    Serial.printf("Display updated (partial refresh)\n");
+    Serial.printf("Display updated (full refresh)\n");
+}
+
+void fetchAndDisplay() {
+    pngBuf = (uint8_t*)malloc(PNG_BUF_SIZE);
+    if (!pngBuf) { Serial.println("Out of memory for PNG buffer"); return; }
+    fetchAndDisplayImpl();
+    free(pngBuf);
+    pngBuf = nullptr;
 }
 
 // ── Info screens ─────────────────────────────────────
@@ -354,21 +391,21 @@ static void showTextScreen(const String& title, const String& sub, const String&
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
-        display.drawRect(8, 8, 800 - 16, 480 - 16, GxEPD_BLACK);
+        display.drawRect(8, 8, PANEL_W - 16, PANEL_H - 16, GxEPD_BLACK);
 
         display.setFont(&FreeSansBold18pt7b);
         display.getTextBounds(title.c_str(), 0, 0, &x1, &y1, &w, &h);
-        display.setCursor((800 - w) / 2, 170);
+        display.setCursor((PANEL_W - w) / 2, 170);
         display.print(title);
 
         display.setFont(&FreeSans12pt7b);
         display.getTextBounds(sub.c_str(), 0, 0, &x1, &y1, &w, &h);
-        display.setCursor((800 - w) / 2, 265);
+        display.setCursor((PANEL_W - w) / 2, 265);
         display.print(sub);
 
         if (detail.length()) {
             display.getTextBounds(detail.c_str(), 0, 0, &x1, &y1, &w, &h);
-            display.setCursor((800 - w) / 2, 325);
+            display.setCursor((PANEL_W - w) / 2, 325);
             display.print(detail);
         }
     } while (display.nextPage());
@@ -411,7 +448,6 @@ void setup() {
                        "Then open:   " + ip);
     });
 
-    wm.resetSettings();
     if (!wm.autoConnect("EPaper-Setup")) {
         Serial.println("WiFi failed — restarting");
         ESP.restart();
@@ -425,7 +461,7 @@ void setup() {
     prefs.begin("epaper", true);
     imageUrl         = prefs.getString("url",         "");
     refreshInterval  = prefs.getUInt("interval",      60);
-    selectedFont     = prefs.getString("font",        "NotoSansHebrew-Bold");
+    selectedFont     = prefs.getString("font",        "Heebo-Bold");
     location         = prefs.getString("location",    "Tel Aviv");
     calendarType     = prefs.getString("calendar",    "gregorian");
     sleepEnabled     = prefs.getBool("sleep_en",      false);
@@ -441,7 +477,7 @@ void setup() {
             rtcAvailable = true;
             Serial.println("RTC found");
         } else {
-            Serial.println("RTC not found — check wiring (SDA→D4, SCL→D5)");
+            Serial.println("RTC not found — check wiring (SDA→GPIO21, SCL→GPIO22)");
         }
     }
 

@@ -1,16 +1,14 @@
 services:
   - type: web
     name: hebrew-clock
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    runtime: docker          # Docker build gives Pillow + libraqm (correct Hebrew shaping)
+    dockerfilePath: ./Dockerfile
+    plan: free
     healthCheckPath: /health
     envVars:
-      - key: FONT_DIR
-        value: .
+      - key: PORT            # the Dockerfile listens on 8765
+        value: 8765
       - key: DISPLAY_LAG
         value: 8
-        sync: false
       - key: LOG_LEVEL
         value: info
-        sync: false

@@ -14,7 +14,7 @@ VALID_FONTS = {
     "DavidLibre-Bold", "FrankRuhlLibre-Bold", "FrankRuhlLibre",
     "Heebo-Bold", "NotoSansHebrew-Bold",
 }
-DEFAULT_FONT = "NotoSansHebrew-Bold"
+DEFAULT_FONT = "Heebo-Bold"
 
 # ── Hebrew time tables ────────────────────────────────
 
@@ -92,6 +92,23 @@ def _png_bytes(img: Image.Image) -> bytes:
     img.convert("1", dither=Image.Dither.NONE).save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf.read()
+
+
+def _strip_niqqud(text: str) -> str:
+    return "".join(ch for ch in text if not "\u05b0" <= ch <= "\u05c7")
+
+
+def _png_bytes_3c(black: Image.Image, red_mask: Image.Image) -> bytes:
+    """Combine an L image (0 = ink) and a red mask (255 = red) into a
+    4-colour paletted PNG: white, black, red."""
+    rgb = black.convert("RGB")
+    rgb.paste((255, 0, 0), mask=red_mask.convert("L").point(lambda p: 255 if p > 127 else 0))
+    pal = Image.new("P", (1, 1))
+    pal.putpalette([255, 255, 255, 0, 0, 0, 255, 0, 0] + [0] * (256 * 3 - 9))
+    q = rgb.quantize(palette=pal, dither=Image.Dither.NONE)
+    buf = io.BytesIO()
+    q.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 def _get_time_period(h: int) -> str:
@@ -202,10 +219,13 @@ def _draw_analog_clock(draw: ImageDraw.Draw, cx: int, cy: int, r: int,
                cy + (r * 0.75) * math.sin(min_angle)], fill=0, width=2)
     draw.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=0)
 
+# Panel resolution (HINK-E075A07-A0 / GDEH075Z90: 880x528)
+PANEL_W, PANEL_H = 880, 528
+
 # ── Image generators ──────────────────────────────────
 
 def _generate_night_image(font_name: str) -> bytes:
-    W, H = 800, 480
+    W, H = PANEL_W, PANEL_H
     img = Image.new("L", (W, H), color=0)
     draw = ImageDraw.Draw(img)
 
@@ -244,7 +264,7 @@ def _generate_night_image(font_name: str) -> bytes:
 
 
 def _generate_quiet_image(font_name: str) -> bytes:
-    W, H = 800, 480
+    W, H = PANEL_W, PANEL_H
     img = Image.new("L", (W, H), color=255)
     draw = ImageDraw.Draw(img)
     PAD1, PAD2 = 8, 16
@@ -258,11 +278,100 @@ def _generate_quiet_image(font_name: str) -> bytes:
     return _png_bytes(img)
 
 
+def _generate_minimal_image(font_name: str, now: datetime.datetime,
+                            weather: dict | None, jewish_date: str | None,
+                            calendar: str = "gregorian") -> bytes:
+    """Minimalist black / white / red layout."""
+    W, H = PANEL_W, PANEL_H
+    img = Image.new("L", (W, H), color=255)
+    red = Image.new("L", (W, H), color=0)
+    d, dr = ImageDraw.Draw(img), ImageDraw.Draw(red)
+
+    M = 44                                   # inner margin
+    d.rounded_rectangle([12, 12, W - 12, H - 12], radius=20, outline=0, width=2)
+
+    # header: main date (right) and digital time (left)
+    greg_txt = _strip_niqqud(
+        f"{DAYS_HE[now.weekday()]}, {now.day} {MONTHS_HE[now.month - 1]} {now.year}")
+    heb_txt = _strip_niqqud(jewish_date.replace("\n", " ")) if jewish_date else ""
+    if calendar == "jewish" and heb_txt:
+        date_txt, second_txt = heb_txt, f"{now.day} {_strip_niqqud(MONTHS_HE[now.month - 1])} {now.year}"
+    else:
+        date_txt, second_txt = greg_txt, heb_txt
+    head_font = get_font(30, font_name)
+    d.text((W - M, 62), date_txt, font=head_font, fill=0, anchor="rm")
+    d.text((M, 62), f"{now.hour:02d}:{now.minute:02d}", font=head_font, fill=0, anchor="lm")
+
+    # centre: the time as words
+    lines = _get_time_lines(now.hour, now.minute)
+    period = next((l for l in lines if l in PERIOD_WORDS), "")
+    words = [l for l in lines if l not in PERIOD_WORDS]
+    prefix = "הַשָּׁעָה"
+    one_line = " ".join([prefix] + words + ([period] if period else []))
+    max_w = W - 2 * M - 20
+
+    def fit(text: str, start: int, minimum: int = 40):
+        size = start
+        while True:
+            f = get_font(size, font_name)
+            bb = d.textbbox((0, 0), text, font=f)
+            if bb[2] - bb[0] <= max_w or size <= minimum:
+                return f
+            size -= 4
+
+    cy = H // 2 - 10
+    f1 = fit(one_line, 72, 56)
+    bb = d.textbbox((0, 0), one_line, font=f1)
+    if bb[2] - bb[0] <= max_w:
+        rows = [one_line]
+    else:
+        rows = [" ".join([prefix, words[0]]), " ".join(words[1:] + ([period] if period else []))]
+        rows = [r for r in rows if r.strip()]
+    fr = [fit(r, 72, 40) for r in rows]
+    line_h = 96
+    top = cy - (len(rows) - 1) * line_h // 2
+    for i, (r, f) in enumerate(zip(rows, fr)):
+        d.text((W // 2, top + i * line_h), r, font=f, fill=0, anchor="mm")
+    ul_y = top + (len(rows) - 1) * line_h + 78
+    dr.rectangle([W // 2 - 46, ul_y, W // 2 + 46, ul_y + 5], fill=255)
+
+    # divider + footer: second date (right cell) | weather (left cell)
+    sep_y = H - 112
+    d.line([(M, sep_y), (W - M, sep_y)], fill=0, width=1)
+    foot_cy = H - 64
+    cell_l, cell_r = (M + W // 2) // 2, (W // 2 + W - M) // 2
+    if weather and second_txt:
+        d.line([(W // 2, sep_y + 22), (W // 2, H - 26)], fill=0, width=1)
+    elif weather:
+        cell_l = W // 2
+    elif second_txt:
+        cell_r = W // 2
+
+    if second_txt:
+        df = get_font(34, font_name)
+        while d.textbbox((0, 0), second_txt, font=df)[2] > (W - 2 * M) // 2 - 20 and df.size > 20:
+            df = get_font(df.size - 2, font_name)
+        d.text((cell_r, foot_cy), second_txt, font=df, fill=0, anchor="mm")
+
+    if weather:
+        desc = _strip_niqqud(weather.get("desc", ""))
+        txt = f"{weather['temp']}°  {desc}".strip()
+        wf = get_font(34, font_name)
+        tb = d.textbbox((0, 0), txt, font=wf)
+        tw = tb[2] - tb[0]
+        text_x = cell_l - 36
+        d.text((text_x, foot_cy), txt, font=wf, fill=0, anchor="mm")
+        _draw_weather_icon(d, text_x + tw // 2 + 52, foot_cy, weather.get("icon_key", "cloud"), size=40)
+
+    return _png_bytes_3c(img, red)
+
+
 def generate_clock_image(
     font_name:   str        = DEFAULT_FONT,
     sleep_time:  bool       = False,
     weather:     dict | None = None,
     jewish_date: str | None  = None,
+    calendar:    str         = "gregorian",
 ) -> bytes:
     fn = font_name if font_name in VALID_FONTS else DEFAULT_FONT
 
@@ -275,104 +384,7 @@ def generate_clock_image(
     if h24 == 6 or (h24 == 7 and m < 30):
         return _generate_quiet_image(fn)
 
-    W, H = 800, 480
-    img  = Image.new("L", (W, H), color=255)
-    draw = ImageDraw.Draw(img)
-
-    PAD1, PAD2 = 8, 16
-    draw.rectangle([PAD1, PAD1, W - PAD1, H - PAD1], outline=0, width=3)
-    draw.rectangle([PAD2, PAD2, W - PAD2, H - PAD2], outline=0, width=1)
-
-    lines       = _get_time_lines(h24, m)
-    time_lines  = [l for l in lines if l not in PERIOD_WORDS]
-    period_line = next((l for l in lines if l in PERIOD_WORDS), "")
-
-    font_large  = get_font(100, fn)
-    font_medium = get_font(58,  fn)
-    font_small  = get_font(34,  fn)
-
-    clock_cx, clock_cy, clock_r = W // 2, PAD2 + 75, 68
-    _draw_analog_clock(draw, clock_cx, clock_cy, clock_r, h24, m, fn)
-
-    text_start_y = clock_cy + clock_r + 15
-    text_area_h  = H - 110 - text_start_y
-    n            = len(time_lines)
-    line_h       = 95
-    total_h      = n * line_h
-    ty           = max(clock_cy + clock_r + 40,
-                       text_start_y + (text_area_h - total_h) // 2 + 10)
-
-    for i, line in enumerate(time_lines):
-        f = font_large
-        while True:
-            bbox = draw.textbbox((0, 0), line, font=f)
-            if (bbox[2] - bbox[0]) < (W - 60):
-                break
-            current_size = getattr(f, "size", 100)
-            if current_size <= 40:
-                break
-            f = get_font(current_size - 6, fn)
-        draw.text((W // 2, ty + i * line_h), line, font=f, fill=0, anchor="mm")
-
-    sep_y = H - 105
-    draw.line([(PAD2 + 8, sep_y), (W - PAD2 - 8, sep_y)], fill=0, width=1)
-    bar_cy    = H - 52
-    bar_left  = PAD2 + 8
-    bar_right = W - PAD2 - 8
-    bar_width = bar_right - bar_left
-    div_x     = bar_left + bar_width // 3
-    div_x2    = bar_left + 2 * bar_width // 3
-    draw.line([(div_x,  H - 92), (div_x,  H - 15)], fill=0, width=1)
-    draw.line([(div_x2, H - 92), (div_x2, H - 15)], fill=0, width=1)
-
-    day_name  = DAYS_HE[now.weekday()]
-    if jewish_date and "\n" in jewish_date:
-        date_str, year_str = jewish_date.split("\n", 1)
-    else:
-        date_str = jewish_date if jewish_date else f"{now.day} {MONTHS_HE[now.month - 1]}"
-        year_str = None
-    left_cx   = (bar_left + div_x) // 2
-    cell_w    = div_x - bar_left - 10
-
-    def _fit_font(text: str, start: int, minimum: int = 18) -> ImageFont.FreeTypeFont:
-        f = get_font(start, fn)
-        while True:
-            bbox = draw.textbbox((0, 0), text, font=f)
-            if (bbox[2] - bbox[0]) <= cell_w:
-                return f
-            cur = getattr(f, "size", start)
-            if cur <= minimum:
-                return f
-            f = get_font(cur - 2, fn)
-
-    if year_str:
-        day_font  = _fit_font(day_name, 28)
-        date_font = _fit_font(date_str, 26)
-        year_font = _fit_font(year_str, 22)
-        draw.text((left_cx, bar_cy - 26), day_name, font=day_font,  fill=0, anchor="mm")
-        draw.text((left_cx, bar_cy),      date_str, font=date_font, fill=0, anchor="mm")
-        draw.text((left_cx, bar_cy + 24), year_str, font=year_font, fill=0, anchor="mm")
-    else:
-        date_font = _fit_font(date_str, 34)
-        draw.text((left_cx, bar_cy - 14), day_name, font=font_small, fill=0, anchor="mm")
-        draw.text((left_cx, bar_cy + 14), date_str, font=date_font,  fill=0, anchor="mm")
-
-    mid_x = (div_x + div_x2) // 2
-    if period_line:
-        draw.text((mid_x, bar_cy), period_line, font=font_small, fill=0, anchor="mm")
-
-    if weather:
-        right_start = div_x2
-        right_end   = W - PAD2 - 8
-        icon_x      = right_start + (right_end - right_start) // 4
-        text_x      = right_start + 3 * (right_end - right_start) // 4
-        _draw_weather_icon(draw, icon_x, bar_cy, weather.get("icon_key", "cloud"), size=34)
-        draw.text((text_x, bar_cy - 14), f"{weather['temp']}°",
-                  font=get_font(40, fn), fill=0, anchor="mm")
-        draw.text((text_x, bar_cy + 16), weather.get("desc", ""),
-                  font=font_small, fill=0, anchor="mm")
-
-    return _png_bytes(img)
+    return _generate_minimal_image(fn, now, weather, jewish_date, calendar)
 
 
 def log_available_fonts() -> None:
