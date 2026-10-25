@@ -10,12 +10,15 @@
 #include <Fonts/FreeSans12pt7b.h>
 #include <RTClib.h>
 
-// ESP32 (classic) -> HINK-E075A07-A0 7.5" 880x528 B/W/R panel (SSD1677, GxEPD2_750c_Z90)
-// Default hardware SPI pins: CLK=GPIO18, DIN/MOSI=GPIO23. Change the four below to match your wiring.
-#define EPD_CS   5
-#define EPD_DC   17
-#define EPD_RST  16
-#define EPD_BUSY 4
+// Waveshare e-Paper ESP32 Driver Board (Rev 3) -> HINK-E075A07-A0 7.5" 880x528 B/W/R (SSD1677, GxEPD2_750c_Z90)
+// The board wires the panel to fixed, non-default SPI pins, so SPI is re-mapped in setup().
+#define EPD_SCK  13
+#define EPD_MISO 12   // not connected on the board, only needed by SPI.begin()
+#define EPD_MOSI 14   // "DIN"
+#define EPD_CS   15
+#define EPD_DC   27
+#define EPD_RST  26
+#define EPD_BUSY 25
 
 #define PANEL_W 880
 #define PANEL_H 528
@@ -418,6 +421,8 @@ void setup() {
     delay(1000);
     Serial.println("Starting...");
 
+    SPI.end();                                          // release the default SPI pins
+    SPI.begin(EPD_SCK, EPD_MISO, EPD_MOSI, EPD_CS);     // map SPI to the driver board's pins
     display.init(115200, true, 2, false);
     display.setRotation(0);
     display.setFullWindow();

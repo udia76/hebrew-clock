@@ -4,6 +4,7 @@ import io
 import math
 import random
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 from loguru import logger
@@ -15,6 +16,7 @@ VALID_FONTS = {
     "Heebo-Bold", "NotoSansHebrew-Bold",
 }
 DEFAULT_FONT = "Heebo-Bold"
+ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
 # ── Hebrew time tables ────────────────────────────────
 
@@ -64,8 +66,8 @@ DAYS_HE = [
 # ── Helpers ───────────────────────────────────────────
 
 def get_israel_time() -> datetime.datetime:
-    utc = datetime.datetime.utcnow()
-    local = utc + datetime.timedelta(hours=3 if 3 <= utc.month <= 10 else 2)
+    """Current Israel local time (naive), following the real DST rules."""
+    local = datetime.datetime.now(ISRAEL_TZ).replace(tzinfo=None)
     return local + datetime.timedelta(seconds=settings.display_lag)
 
 
