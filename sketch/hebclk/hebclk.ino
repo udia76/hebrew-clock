@@ -5,10 +5,12 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
 #include <time.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
 #include <RTClib.h>
+#include <esp_system.h>
 
 // Waveshare e-Paper ESP32 Driver Board (Rev 3) -> HINK-E075A07-A0 7.5" 880x528 B/W/R (SSD1677, GxEPD2_750c_Z90)
 // The board wires the panel to fixed, non-default SPI pins, so SPI is re-mapped in setup().
@@ -42,6 +44,15 @@ String   imageUrl;
 uint32_t refreshInterval  = 60;
 uint32_t lastRefresh      = 0;
 uint8_t  refreshCount     = 0;
+int      failCount        = 0;   // consecutive failed fetches
+String   otaPassword      = "";  // empty = wireless (OTA) updates disabled
+bool     otaEnabled       = false;
+// Last fetch result, shown on http://<device-ip>/status for debugging without USB.
+static String   gLastResult  = "no fetch yet";
+static uint32_t gLastOkMs    = 0;
+static uint32_t gOkCount     = 0;
+static uint32_t gFailTotal   = 0;
+static const char* gResetWhy = "?";
 String   selectedFont     = "Heebo-Bold";
 String   location         = "Tel Aviv";
 
@@ -189,6 +200,10 @@ static const char CONFIG_HTML[] PROGMEM = R"(<!DOCTYPE html>
     <label>Refresh interval (seconds, outside sleep window)</label>
     <input type="number" name="interval" value="{{INTERVAL}}" min="1">
 
+    <label>Wireless update (OTA) password</label>
+    <input type="password" name="ota_pw" value="" placeholder="{{OTA_STATE}}" autocomplete="new-password">
+    <p class="note">Min. 6 characters. Leave empty to keep the current setting, type <b>-</b> to disable OTA. Takes effect after restart.</p>
+
     <hr>
 
     <div class="row">
@@ -213,6 +228,21 @@ static const char* FONTS[] = {
     "Heebo-Bold", "NotoSansHebrew-Bold"
 };
 
+void handleStatus() {
+    auto ago = [](uint32_t t) { return t ? String((millis() - t) / 1000) + " s ago" : String("never"); };
+    String s = "Last fetch: " + gLastResult + "\n";
+    s += "Last OK: " + ago(gLastOkMs) + "\n";
+    s += "OK count: " + String(gOkCount) + "   total failures: " + String(gFailTotal) +
+         "   failures in a row: " + String(failCount) + "\n";
+    s += "Uptime: " + String(millis() / 1000) + " s\n";
+    s += "Reset reason: " + String(gResetWhy) + "\n";
+    s += "Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? "connected" : "DOWN") +
+         "  RSSI " + String(WiFi.RSSI()) + " dBm\n";
+    s += "Free heap: " + String(ESP.getFreeHeap()) + "  largest block: " + String(ESP.getMaxAllocHeap()) + "\n";
+    s += "Interval: " + String(refreshInterval) + " s\n";
+    server.send(200, "text/plain; charset=utf-8", s);
+}
+
 void handleRoot() {
     String fontOptions;
     for (const char* f : FONTS) {
@@ -234,6 +264,7 @@ void handleRoot() {
     html.replace("{{SLEEP_START}}",      sleepStart);
     html.replace("{{SLEEP_END}}",        sleepEnd);
     html.replace("{{INTERVAL}}",         String(refreshInterval));
+    html.replace("{{OTA_STATE}}",        otaPassword.length() ? "OTA enabled (password set)" : "OTA disabled");
     html.replace("{{RTC_EN_CHECKED}}",   rtcEnabled ? "checked" : "");
     server.send(200, "text/html; charset=utf-8", html);
 }
@@ -256,6 +287,12 @@ void handleConfig() {
         sleepEnd = server.arg("sleep_end");
     if (server.hasArg("interval") && server.arg("interval").toInt() > 0)
         refreshInterval = (uint32_t)server.arg("interval").toInt();
+    if (server.hasArg("ota_pw")) {
+        String pw = server.arg("ota_pw");
+        pw.trim();
+        if (pw == "-") otaPassword = "";
+        else if (pw.length() >= 6) otaPassword = pw;
+    }
 
     prefs.begin("epaper", false);
     prefs.putString("url",         imageUrl);
@@ -266,6 +303,7 @@ void handleConfig() {
     prefs.putString("sleep_start", sleepStart);
     prefs.putString("sleep_end",   sleepEnd);
     prefs.putUInt("interval",      refreshInterval);
+    prefs.putString("ota_pw",      otaPassword);
     prefs.putBool("rtc_en",        rtcEnabled);
     prefs.end();
 
@@ -295,7 +333,14 @@ int pngDrawCallback(PNGDRAW *pDraw) {
 
 // ── Image fetch + display ─────────────────────────────
 
-static void fetchAndDisplayImpl() {
+static bool fail(const String& why) {
+    gLastResult = why;
+    gFailTotal++;
+    Serial.println("FAIL: " + why);
+    return false;
+}
+
+static bool fetchAndDisplayImpl() {
     String url = buildFetchUrl();
     Serial.printf("Fetching: %s\n", url.c_str());
 
@@ -303,17 +348,17 @@ static void fetchAndDisplayImpl() {
     secureClient.setInsecure();
 
     HTTPClient http;
+    http.setConnectTimeout(8000);
+    http.setTimeout(10000);         // never block forever on a stalled connection
     http.setReuse(false);           // do not keep the connection (and its TLS memory) alive
     if (!http.begin(secureClient, url)) {
-        Serial.println("HTTP begin failed");
-        return;
+        return fail("HTTP begin failed (bad URL?)");
     }
 
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
-        Serial.printf("HTTP error: %d\n", code);
         http.end();
-        return;
+        return fail("HTTP " + String(code) + (code < 0 ? " " + HTTPClient::errorToString(code) : ""));
     }
 
     int contentLen = http.getSize();
@@ -321,7 +366,21 @@ static void fetchAndDisplayImpl() {
     int pngLen = 0;
 
     if (contentLen > 0 && contentLen <= (int)PNG_BUF_SIZE) {
-        pngLen = stream->readBytes(pngBuf, contentLen);
+        // readBytes() gives up after 1 s of silence, which truncates the image on a slow or
+        // weak Wi-Fi link. Keep reading until everything arrived or the link really stalls.
+        uint32_t deadline = millis() + 15000;
+        while (pngLen < contentLen && millis() < deadline) {
+            int avail = stream->available();
+            if (avail > 0) {
+                int toRead = min(avail, contentLen - pngLen);
+                pngLen  += stream->readBytes(pngBuf + pngLen, toRead);
+                deadline = millis() + 5000;      // progress -> extend the stall timeout
+            } else if (!http.connected()) {
+                break;
+            } else {
+                delay(5);
+            }
+        }
     } else {
         uint32_t deadline = millis() + 10000;
         while ((http.connected() || stream->available()) && pngLen < (int)PNG_BUF_SIZE) {
@@ -341,16 +400,24 @@ static void fetchAndDisplayImpl() {
     secureClient.stop();
     Serial.printf("Downloaded %d bytes  (free heap %u, largest block %u)\n",
                   pngLen, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-    if (pngLen == 0) return;
+    if (pngLen == 0) return fail("empty download");
+    if (contentLen > 0 && pngLen != contentLen) return fail("truncated download " + String(pngLen) + "/" + String(contentLen));
 
     int rc = png.openRAM(pngBuf, pngLen, pngDrawCallback);
-    if (rc != PNG_SUCCESS) { Serial.printf("PNG open error: %d\n", rc); return; }
+    if (rc != PNG_SUCCESS) return fail("PNG open error " + String(rc) + " (server sent a non-PNG?)");
     if (png.getWidth() != PANEL_W || png.getHeight() != PANEL_H) {
-        Serial.printf("Wrong dimensions: %dx%d\n", png.getWidth(), png.getHeight());
-        png.close(); return;
+        String w = "wrong size " + String(png.getWidth()) + "x" + String(png.getHeight());
+        png.close(); return fail(w);
     }
 
     png.close();
+
+    // Dry run: decode the whole PNG without drawing. If it is damaged we keep the old
+    // picture on the panel instead of refreshing it with blank pages.
+    gPageY0 = gPageY1 = -1;
+    rc = png.openRAM(pngBuf, pngLen, pngDrawCallback);
+    if (rc == PNG_SUCCESS) { rc = png.decode(NULL, 0); png.close(); }
+    if (rc != PNG_SUCCESS) return fail("PNG decode error " + String(rc) + " (panel left unchanged)");
 
     // Paged drawing: the PNG stays in RAM (~5 KB) and is decoded once per display page
     // (33 rows each), so no 58 KB frame buffers are needed.
@@ -374,14 +441,47 @@ static void fetchAndDisplayImpl() {
 
     refreshCount++;
     Serial.printf("Display updated (full refresh, %d pages)\n", page);
+    if (!decodeOk) return fail("PNG decode error while drawing");
+    gLastResult = "ok";
+    gLastOkMs   = millis();
+    gOkCount++;
+    return true;
 }
 
-void fetchAndDisplay() {
+bool fetchAndDisplay() {
     pngBuf = (uint8_t*)malloc(PNG_BUF_SIZE);
-    if (!pngBuf) { Serial.println("Out of memory for PNG buffer"); return; }
-    fetchAndDisplayImpl();
+    if (!pngBuf) { Serial.println("Out of memory for PNG buffer"); return false; }
+    // A flaky download or a server that is still waking up is usually fine on the next try,
+    // so retry a few times before counting it as a failure.
+    bool ok = false;
+    for (int attempt = 1; attempt <= 3 && !ok; attempt++) {
+        ok = fetchAndDisplayImpl();
+        if (!ok && attempt < 3) { Serial.printf("Retry %d/2 in 3 s\n", attempt); delay(3000); }
+    }
     free(pngBuf);
     pngBuf = nullptr;
+    return ok;
+}
+
+// ── Self-recovery ─────────────────────────────────────
+// A watchdog task restarts the board if loop() stops running (e.g. a hung connection),
+// and loop() restarts it after repeated failures or a long Wi-Fi outage.
+static volatile uint32_t gHeartbeat = 0;
+static const uint32_t WATCHDOG_MS   = 300000;   // loop must tick at least every 5 min
+static const int      MAX_FAILURES  = 5;        // consecutive failed fetches before restart
+static const uint32_t WIFI_DOWN_MAX = 300000;   // restart after 5 min without Wi-Fi
+static uint32_t wifiDownSince = 0;
+static uint32_t lastReconnect = 0;
+
+static void watchdogTask(void*) {
+    for (;;) {
+        vTaskDelay(10000 / portTICK_PERIOD_MS);
+        if (millis() - gHeartbeat > WATCHDOG_MS) {
+            Serial.println("Watchdog: loop stuck -> restarting");
+            delay(100);
+            ESP.restart();
+        }
+    }
 }
 
 // ── Info screens ─────────────────────────────────────
@@ -425,9 +525,25 @@ void setup() {
     SPI.begin(EPD_SCK, EPD_MISO, EPD_MOSI, EPD_CS);     // map SPI to the driver board's pins
     display.init(115200, true, 2, false);
     display.setRotation(0);
-    display.setFullWindow();
-    display.firstPage();
-    do { display.fillScreen(GxEPD_WHITE); } while (display.nextPage());
+    // After a software restart (config saved, watchdog) keep the current picture on the panel
+    // instead of flashing it white and showing status screens.
+    const bool quickBoot = (esp_reset_reason() == ESP_RST_SW);
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  gResetWhy = "power on";                         break;
+        case ESP_RST_SW:       gResetWhy = "software restart (watchdog/config)"; break;
+        case ESP_RST_BROWNOUT: gResetWhy = "BROWNOUT (power supply too weak)";   break;
+        case ESP_RST_PANIC:    gResetWhy = "crash (panic)";                    break;
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:      gResetWhy = "hardware watchdog (stuck)";        break;
+        default:               gResetWhy = "other";                            break;
+    }
+    Serial.printf("Reset reason: %s\n", gResetWhy);
+    if (!quickBoot) {
+        display.setFullWindow();
+        display.firstPage();
+        do { display.fillScreen(GxEPD_WHITE); } while (display.nextPage());
+    }
     Serial.println("ePaper initialized");
 
     WiFiManagerParameter paramUrl("image_url", "Image URL", "", 256);
@@ -462,13 +578,16 @@ void setup() {
     Serial.print("WiFi connected, IP: ");
     Serial.println(WiFi.localIP());
 
-    showTextScreen("Connected", WiFi.localIP().toString());
-    delay(2000);
+    if (!quickBoot) {
+        showTextScreen("Connected", WiFi.localIP().toString());
+        delay(2000);
+    }
 
     prefs.begin("epaper", true);
     imageUrl         = prefs.getString("url",         "");
     imageUrl.trim();
     refreshInterval  = prefs.getUInt("interval",      60);
+    otaPassword      = prefs.getString("ota_pw",      "");
     selectedFont     = prefs.getString("font",        "Heebo-Bold");
     location         = prefs.getString("location",    "Tel Aviv");
     calendarType     = prefs.getString("calendar",    "gregorian");
@@ -521,11 +640,25 @@ void setup() {
 
     server.on("/",       HTTP_GET,  handleRoot);
     server.on("/config", HTTP_POST, handleConfig);
+    server.on("/status", HTTP_GET,  handleStatus);
+    if (otaPassword.length() >= 6) {
+        ArduinoOTA.setHostname("hebrew-clock");
+        ArduinoOTA.setPassword(otaPassword.c_str());
+        ArduinoOTA.onStart([]()  { Serial.println("OTA update starting"); });
+        ArduinoOTA.onEnd([]()    { Serial.println("OTA update done, restarting"); });
+        ArduinoOTA.onError([](ota_error_t e) { Serial.printf("OTA error %u\n", (unsigned)e); });
+        ArduinoOTA.begin();
+        otaEnabled = true;
+        Serial.println("OTA enabled: hostname hebrew-clock");
+    }
     server.begin();
     Serial.printf("Config UI: http://%s/\n", WiFi.localIP().toString().c_str());
 
+    gHeartbeat = millis();
+    xTaskCreate(watchdogTask, "watchdog", 2048, nullptr, 1, nullptr);
+
     if (imageUrl.length() > 0) {
-        fetchAndDisplay();
+        if (!fetchAndDisplay()) failCount++;
     } else {
         Serial.println("No URL configured — open the config UI to set one");
     }
@@ -535,11 +668,37 @@ void setup() {
 // ── Loop ──────────────────────────────────────────────
 
 void loop() {
+    gHeartbeat = millis();
     server.handleClient();
+    if (otaEnabled) ArduinoOTA.handle();
+
+    // Wi-Fi supervision: try to reconnect, restart if it stays down.
+    if (WiFi.status() != WL_CONNECTED) {
+        if (wifiDownSince == 0) wifiDownSince = millis();
+        if (millis() - lastReconnect > 20000) {
+            Serial.println("Wi-Fi down -> reconnecting");
+            WiFi.reconnect();
+            lastReconnect = millis();
+        }
+        if (millis() - wifiDownSince > WIFI_DOWN_MAX) {
+            Serial.println("Wi-Fi down too long -> restarting");
+            delay(100);
+            ESP.restart();
+        }
+        delay(100);
+        return;
+    }
+    wifiDownSince = 0;
 
     if (imageUrl.length() > 0 &&
         (millis() - lastRefresh) >= activeInterval() * 1000UL) {
-        fetchAndDisplay();
+        if (fetchAndDisplay()) {
+            failCount = 0;
+        } else if (++failCount >= MAX_FAILURES) {
+            Serial.printf("%d failed fetches in a row -> restarting\n", failCount);
+            delay(100);
+            ESP.restart();
+        }
         lastRefresh = millis();
     }
     delay(10);
